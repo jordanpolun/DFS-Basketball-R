@@ -1,0 +1,512 @@
+---
+title: "Fantasy Basketball"
+author: "Jordan Polun"
+date: "10/21/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(knitr)
+library(plotly)
+library(lubridate)
+library(DT)
+library(broom)
+
+```
+
+
+### Reading in player ids
+#### Here's a random sample of 10 of them and their information
+```{r Read player ids, echo=F}
+
+player_ids_df <- read.csv("Player IDs.csv",
+                          header=T)
+kable(sample_n(player_ids_df, 10))
+
+```
+
+
+### Running a multiple regression model on each player for each Fantasy team by reading gamelogs over the last 3 seasons and current season schedules. Projecting performance in each game.
+```{r Read player schedules, echo=F, warning=F}
+
+run_projection <- function(id)
+{
+  schedule <-
+    read.csv(paste("Player Schedules/", id, " Schedule.csv", sep = ""),
+             header = T)
+
+  # team_ stats are what the player's team got per game
+  # opp_ stats are what the opponent got per game
+  # team_opp_ stats are what the player's team generally allowed per game
+  # opp_opp stats are what the opponent's opponents generally allowed per game
+
+  gamelog <-
+    read.csv(paste("Game Logs/", id, " Game Logs.csv", sep = ""),
+             header = T) %>%
+    filter(Season >= 2018) %>%
+    filter(!(fp %in% boxplot.stats(fp)$out)) # Remove outliers (injuries mid-game, etc.)
+
+  Reg.PTS <- lm(pts ~ team_pts + opp_opp_pts + pts, data=gamelog)
+  Reg.ORB <- lm(orb ~ team_orb + opp_opp_orb + orb, data=gamelog)
+  Reg.DRB <- lm(drb ~ team_drb + opp_opp_drb + drb, data=gamelog)
+  Reg.AST <- lm(ast ~ team_ast + opp_opp_ast + ast, data=gamelog)
+  Reg.STL <- lm(stl ~ team_stl + opp_opp_stl + stl, data=gamelog)
+  Reg.BLK <- lm(blk ~ team_blk + opp_opp_blk + blk, data=gamelog)
+  Reg.TOV <- lm(tov ~ team_tov + opp_opp_tov + tov, data=gamelog)
+  Reg.PF <- lm(pf ~ team_pf + opp_opp_pf + pf, data=gamelog)
+
+  Proj.PTS <- as.data.frame(predict(Reg.PTS, newdata=schedule, interval="confidence"))
+  Proj.ORB <- as.data.frame(predict(Reg.ORB, newdata=schedule, interval="confidence"))
+  Proj.DRB <- as.data.frame(predict(Reg.DRB, newdata=schedule, interval="confidence"))
+  Proj.AST <- as.data.frame(predict(Reg.AST, newdata=schedule, interval="confidence"))
+  Proj.STL <- as.data.frame(predict(Reg.STL, newdata=schedule, interval="confidence"))
+  Proj.BLK <- as.data.frame(predict(Reg.BLK, newdata=schedule, interval="confidence"))
+  Proj.TOV <- as.data.frame(predict(Reg.TOV, newdata=schedule, interval="confidence"))
+  Proj.PF <- as.data.frame(predict(Reg.PF, newdata=schedule, interval="confidence")) %>%
+    mutate(ifelse(fit > 6, 6, fit))
+
+  Proj.FP <- Proj.PTS$fit + Proj.DRB$fit + (Proj.ORB$fit * 1.5) + (Proj.AST$fit * 2) + (Proj.STL$fit * 2) + (Proj.BLK$fit * 3) - Proj.TOV$fit - Proj.PF$fit
+  Proj.FP.Lwr <- Proj.PTS$lwr + Proj.DRB$lwr + (Proj.ORB$lwr * 1.5) + (Proj.AST$lwr * 2) + (Proj.STL$lwr * 2) + (Proj.BLK$lwr * 3) - Proj.TOV$lwr - Proj.PF$lwr
+  Proj.FP.Upr <- Proj.PTS$upr + Proj.DRB$upr + (Proj.ORB$upr * 1.5) + (Proj.AST$upr * 2) + (Proj.STL$upr * 2) + (Proj.BLK$upr * 3) - Proj.TOV$upr - Proj.PF$upr
+
+  schedule <- data.frame(schedule, Proj.FP, Proj.FP.Lwr, Proj.FP.Upr, Proj.PTS$fit, Proj.ORB$fit, Proj.DRB$fit, Proj.AST$fit, Proj.STL$fit, Proj.BLK$fit, Proj.TOV$fit, Proj.PF$fit)
+
+  schedule <- schedule %>%
+    mutate(Player.ID = id,
+           Name = player_ids_df[which(player_ids_df$ID == id), "Name"],
+           Fantasy.Team = player_ids_df[which(player_ids_df$ID == id), "Fantasy.Team"],
+           Position = player_ids_df[which(player_ids_df$ID == id), "Position"],
+           Date = ymd(Date)) %>%
+    arrange(Date) %>%
+    mutate(Game.Num = 1:n())
+
+  return(schedule)
+
+}
+
+# Projecting the performance of every active player in every scheduled game
+all_performances_df <- data.frame()
+
+for (id in player_ids_df$ID)
+{
+  all_performances_df <- rbind(all_performances_df, run_projection(id)) %>%
+    arrange(Date) %>%
+    drop_na()
+}
+
+
+
+
+
+# Adding in Week.Num
+nextweekday <- function(date, wday) {
+  date <- as.Date(date)
+  diff <- wday - wday(date)
+  diff <- ifelse(diff < 0, diff + 7, diff)
+  return (date + diff)
+}
+
+all_performances_df <- all_performances_df %>%
+  mutate(Week.End = nextweekday(Date, 1))
+
+week_lookup <- data.frame(Week.End = unique(all_performances_df$Week.End), Week.Num = 1:length(unique(all_performances_df$Week.End)))
+all_performances_df <- merge(all_performances_df, week_lookup, by = "Week.End")
+
+
+
+
+
+# Finding the average game performance per player
+average_player_performance_df <- all_performances_df %>%
+  select(Player.ID, Name, Fantasy.Team, Date, Proj.FP, Proj.FP.Lwr, Proj.FP.Upr) %>%
+  group_by(Player.ID, Name, Fantasy.Team) %>%
+  summarize(
+    Consistency = sd(Proj.FP),
+    Proj.FP = median(Proj.FP),
+    Proj.FP.Lwr = median(Proj.FP.Lwr),
+    Proj.FP.Upr = median(Proj.FP.Upr)
+  ) %>%
+  arrange(desc(Proj.FP))
+
+
+
+
+# This will be our testing model to prove our functions work
+model_df <- average_player_performance_df %>%
+  mutate(Fantasy.Team = ifelse(Name %in% head(., 12)$Name, "Best.Team",
+                        ifelse(Name %in% tail(., 12)$Name, "Worst.Team",
+                               "Middle.Team")))
+  
+
+
+
+
+# Showing projections graphically
+kable(head(average_player_performance_df, 8))
+
+proj_plot <- ggplot(average_player_performance_df, aes(x=reorder(Name, Proj.FP), y=Proj.FP, color=Fantasy.Team)) +
+  geom_point(stat="identity") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+ggplotly(proj_plot)
+
+```
+
+
+### Analyzing weekly performance
+#### Using the filters on the bottom, we can find the ideal lineup for each team for each week.
+```{r Analyzing projected week performances, echo=F}
+
+# Calculating predicted weekly performance per player
+projWeeklyPerformance <- function(performances_df, injuries=F)
+{
+  if (injuries)
+  {
+    # According to https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3445097/
+    # 59179 games were missed due to injury over 16 seasons from 1989-2005, or roughly 3698.6875 per season
+    # It is a good enough estimate for this case
+    injury_prob <- 3698.6875/nrow(all_performances_df)
+    performances_df <- cbind(performances_df, Injured = sample(c(T, F),
+                                                               size = nrow(performances_df),
+                                                               replace = TRUE,
+                                                               prob = c(injury_prob, 1 - injury_prob)))
+  }
+  
+  week_projections <- performances_df %>%
+    group_by(Name, Fantasy.Team, Week.Num) %>%
+    summarize(Week.Proj.FP = sum(Proj.FP),
+              Week.Proj.FP.Lwr = sum(Proj.FP.Lwr),
+              Week.Proj.FP.Upr = sum(Proj.FP.Upr),
+              Games = n()) %>%
+    arrange(desc(Week.Proj.FP)) %>%
+    drop_na()
+  
+  return(week_projections)
+    
+}
+
+week_projections <- projWeeklyPerformance(all_performances_df)
+week_proj_inj <- projWeeklyPerformance(all_performances_df, injuries=T)
+datatable(week_projections, filter="bottom", option = list(pageLength = 8))
+
+```
+
+
+### Analyzing resiliency
+#### This means analyzing the deviation of games played each week per Fantasy.Team because some losses only happen because the best players don't play enough games to be productive.
+#### We will also measure the deviation of Proj.FP of the players per team, to measure how swappable the players are in case of injury or schedule conflicts
+```{r Analyzing schedule collisions, echo=F}
+
+analyze_resiliency <- function(average_projections, projections)
+{
+  fantasy_team_deviation <- average_projections %>%
+    group_by(Fantasy.Team) %>%
+    summarize(Roster.Size = n(),
+              Player.FP.Dev = sd(Proj.FP),
+              Team.Consistency = mean(Consistency)) %>%
+    arrange(Player.FP.Dev)
+  
+  schedule_collisions <- projections %>%
+    group_by(Fantasy.Team, Week.Num) %>%
+    summarize(Games.Played = n()) %>%
+    group_by(Fantasy.Team) %>%
+    summarize(Weekly.Game.Deviation = sd(Games.Played)) %>%
+    arrange(Weekly.Game.Deviation)
+  
+  fantasy_team_deviation <- merge(fantasy_team_deviation, schedule_collisions, by="Fantasy.Team") %>%
+    mutate(Resiliency = (Weekly.Game.Deviation - min(Weekly.Game.Deviation)) + (Player.FP.Dev - min(Player.FP.Dev)) + (Team.Consistency - min(Team.Consistency))) %>%
+    arrange(Resiliency)
+  
+  return(fantasy_team_deviation)
+}
+
+
+resiliency_df <- analyze_resiliency(average_player_performance_df, all_performances_df)
+datatable(resiliency_df, option=list(dom='t', pageLength=12))
+
+```
+
+
+### Comparing team Fantasy.Point distribution
+```{r, Comparing distributions, echo=F}
+
+compareDistributions <- function(df)
+{
+  df %>%
+    ggplot(aes(Proj.FP)) +
+      geom_density() +
+      geom_vline(xintercept = mean(df$Proj.FP), linetype="dotted") + 
+      facet_wrap(~Fantasy.Team)
+}
+
+compareDistributions(model_df)
+compareDistributions(average_player_performance_df)
+
+```
+
+
+### Calculating projected standings
+```{r, Calculating standings, echo=F}
+
+getWins <- function(performances_df, injuries = F)
+{
+  matchups <- read.csv("Matchups.csv",
+                     header=T)
+  names(matchups)[1]<-"Teams"
+  
+  week_proj <- projWeeklyPerformance(all_performances_df, injuries)
+  
+  # Get weekly point projections for each team
+  team_week_projections <- week_proj %>%
+    group_by(Fantasy.Team, Week.Num) %>%
+    summarize(Proj.Team.Points = sum(Week.Proj.FP[1:8]),
+              Proj.Team.Points.Lwr = sum(Week.Proj.FP.Lwr[1:8]),
+              Proj.Team.Points.Upr = sum(Week.Proj.FP.Upr[1:8]),
+              Actual.Team.Points = sample(Proj.Team.Points.Lwr:Proj.Team.Points.Upr, 1)) %>%
+    filter(Week.Num <= 21)
+  
+  view(team_week_projections)
+  
+  
+  team_points <- team_week_projections$Actual.Team.Points
+  
+  # Get list of opponents in order
+  opponents <- c()
+  for (i in 1:nrow(matchups))
+  {
+    names <- as.character(tail(unname(unlist(matchups[i,])), -1))
+    opponents <- append(opponents, names)
+  }
+  
+  # Add it to the list
+  team_week_projections <- data.frame(team_week_projections, Opponent = opponents) %>%
+    arrange(Opponent, Week.Num) %>%
+    mutate(Opp.Points = team_points,
+           Win = ifelse(Actual.Team.Points > Opp.Points, 1, 0)) %>%
+    arrange(Fantasy.Team, Week.Num)
+  
+  # Calculating wins
+  proj_standings <- team_week_projections %>%
+    group_by(Fantasy.Team) %>%
+    summarize(Wins = sum(Win)) %>%
+    arrange(Fantasy.Team)
+  
+  return(proj_standings$Wins)
+}
+
+projStandings <- function(performances_df, trials = 1000, injuries = F)
+{
+  
+  proj_wins <- rep.int(0, times=12)
+  for (i in 1:trials)
+  {
+    proj_wins <- proj_wins + getWins(all_performances_df, injuries)
+  }
+  
+  # Make data.frame to show data by Fantasy.Team
+  proj_standings <- sort(unique(all_performances_df$Fantasy.Team))
+  
+  # Get some team data
+  team_df <- performances_df %>%
+    group_by(Fantasy.Team) %>%
+    summarize(StDev.FP = sd(Proj.FP),
+              Mean.FP = mean(Proj.FP))
+  
+  # Add in resiliency
+  proj_standings <- data.frame(Fantasy.Team = proj_standings, Wins = proj_wins/trials) %>%
+    merge(resiliency_df, on="Fantasy.Team") %>%
+    merge(team_df, on="Fantasy.Team") %>%
+    select(Fantasy.Team, Wins, Resiliency, Mean.FP, StDev.FP) %>%
+    arrange(desc(Wins))
+  
+  return (proj_standings)
+}
+
+proj_standings <- projStandings(all_performances_df, trials=3, injuries=T)
+kable(proj_standings)
+
+```
+
+
+### Testing trades
+```{r Testing trades, echo=F}
+
+# swapPlayers <- function(player_df, trade_players, trade_teams)
+# {
+# 
+#   trade_df <- player_df %>%
+#     filter(Name %in% trade_players) %>%
+#     mutate(Fantasy.Team = ifelse(Fantasy.Team == trade_teams[1],
+#                                      trade_teams[2],
+#                                      trade_teams[1]))
+# 
+#   print(unique(trade_df$Name))
+# 
+#   others_df <- player_df %>%
+#     filter(!(Name %in% trade_players))
+# 
+#   return(rbind(trade_df, others_df))
+# }
+# 
+# trade_players <- c("Tyler Herro", "John Collins", "Jarrett Allen", "Enes Kanter")
+# trade_teams <- c("Penetrating P Pusher", "Terabytes")
+# print(paste("Swapping teams for", trade_players))
+# 
+# trade_df <- swapPlayers(all_performances_df, trade_players, trade_teams)
+# 
+# average_trade_df <- trade_df %>%
+#   select(Player.ID, Name, Fantasy.Team, Date, Proj.FP, Proj.FP.Lwr, Proj.FP.Upr) %>%
+#   group_by(Player.ID, Name, Fantasy.Team) %>%
+#   summarize(
+#     Consistency = sd(Proj.FP),
+#     Proj.FP = mean(Proj.FP),
+#     Proj.FP.Lwr = mean(Proj.FP.Lwr),
+#     Proj.FP.Upr = mean(Proj.FP.Upr)
+#   ) %>%
+#   arrange(desc(Proj.FP))
+# 
+# trade_resiliency <- analyze_resiliency(average_trade_df, trade_df)
+# 
+# movement = rank(arrange(trade_resiliency, Fantasy.Team)$Resiliency) - rank(arrange(resiliency_df, Fantasy.Team)$Resiliency)
+# trade_resiliency <- trade_resiliency %>%
+#   arrange(Fantasy.Team) %>%
+#   mutate(Movement = movement) %>%
+#   arrange(Resiliency)
+# 
+# datatable(trade_resiliency, option=list(dom='t', pageLength=12))
+# 
+# proj_plot <- ggplot(average_trade_df, aes(x=reorder(Name, Proj.FP), y=Proj.FP, color=Fantasy.Team)) +
+#   geom_point(stat="identity") +
+#   theme(axis.text.x = element_blank(),
+#         axis.ticks.x = element_blank())
+# 
+# ggplotly(proj_plot)
+# 
+# compareDistributions(average_trade_df)
+# proj_standings <- projStandings(trade_df, trials=3, injuries=T)
+# kable(proj_standings)
+
+```
+
+
+### Running Fantasy simulations
+#### We're going to run a simulation of this season 1000 times with randommly generated teams to see what roster makeups led to the most effective rosters. Is resiliency as important as it seems? Is it better to put all your eggs into one basket (no pun intended)? Is it a mixture of the two? Let's find out.
+##### The first step is to draft our teams. Randomly selecting the rosters from the pool of players sounds best in theory, but we have to keep in mind that some players are better than others. In a truly random system, it's very possible--perhaps even likely--that a randomly selected team consists of terrible players because they were chosen at random. To remedy this, we will use k-means to cluster our players into 12 groups, for 12 rounds of drafting. Then, each team will randomly select a player from each of those groups without replacement.
+```{r Running Fantasy simulations, echo=F}
+
+fantasyDraft <- function(player_df, keepers=F)
+{
+  players_no_teams <- data.frame()
+  fantasy_teams <- c()
+  
+  if (keepers)
+  {
+    keepers <- player_df %>%
+      group_by(Fantasy.Team, Player.ID, Name, Position) %>%
+      summarize(Proj.FP = mean(Proj.FP),
+                Proj.PTS = mean(Proj.PTS.fit),
+                Proj.ORB = mean(Proj.ORB.fit),
+                Proj.DRB = mean(Proj.DRB.fit),
+                Proj.AST = mean(Proj.AST.fit),
+                Proj.STL = mean(Proj.STL.fit),
+                Proj.BLK = mean(Proj.BLK.fit),
+                Proj.TOV = mean(Proj.TOV.fit),
+                Proj.PF = mean(Proj.PF.fit)) %>%
+      group_by(Fantasy.Team) %>%
+      top_n(2), Proj.FP) %>%
+      ungroup()
+    
+    fantasy_teams <- sample(unique(player_df$Fantasy.Team))
+  }
+  
+  else
+  {
+    # Randomize draft order
+    fantasy_teams <- sample(unique(player_df$Fantasy.Team))
+  }
+  
+  # Making the dataframe of each player and their projected stats
+  players_no_teams <- player_df %>%
+    group_by(Player.ID, Name, Position) %>%
+    summarize(Proj.FP = mean(Proj.FP),
+              Proj.PTS = mean(Proj.PTS.fit),
+              Proj.ORB = mean(Proj.ORB.fit),
+              Proj.DRB = mean(Proj.DRB.fit),
+              Proj.AST = mean(Proj.AST.fit),
+              Proj.STL = mean(Proj.STL.fit),
+              Proj.BLK = mean(Proj.BLK.fit),
+              Proj.TOV = mean(Proj.TOV.fit),
+              Proj.PF = mean(Proj.PF.fit)) %>%
+    arrange(desc(Proj.FP))
+  
+  
+  # Serpentine draft order
+  fantasy_teams <- fantasy_teams[c(fantasy_teams, rev(fantasy_teams))]
+  
+  # Add in draft rounds
+  players_no_teams <- data.frame(players_no_teams, Round = head(rep(1:12, each=12), nrow(players_no_teams)))
+  
+  # Randomize player order
+  drafted_player_df <- players_no_teams[sample(nrow(players_no_teams)),] %>%
+    arrange(Round)
+  
+  # Assign fantasy teams to randomized players
+  drafted_player_df <- data.frame(drafted_player_df, Fantasy.Team = head(rep(fantasy_teams, 6), nrow(drafted_player_df)))
+  return(drafted_player_df)
+  
+}
+
+
+seasons <- 3
+sim_df <- data.frame()
+
+# Run fantasy draft without keepers
+mean_fantasy_df <- fantasyDraft(all_performances_df)
+
+for (i in 1:seasons)
+{
+  # Get new teams in all_performances_df
+  new_team_lookup <- mean_fantasy_df %>%
+    select(Name, Fantasy.Team)
+  
+  # Get game performances of each player on their new fantasy team
+  all_fantasy_perf_df <- all_performances_df %>%
+    select(-Fantasy.Team) %>%
+    merge(new_team_lookup, on="Name")
+  
+  # Calculate standings for this season
+  season_standings <- projStandings(all_fantasy_perf_df, trials=3, injuries=T) %>%
+    select(Wins, Resiliency, Mean.FP, StDev.FP)
+  sim_df <- rbind(season_standings, sim_df)
+  
+  # Redraft for next trial using keepers
+  mean_fantasy_df <- fantasyDraft(all_performances_df, keepers=T)
+}
+
+# Sort our simulation data by wins
+sim_df <- sim_df %>%
+  arrange(desc(Wins))
+
+# Export the data from the simulation
+kable(head(sim_df))
+write.csv(sim_df, "Simulations.csv")
+
+```
+
+
+##### Now that we've run our simulations, let's check to see if there are any patterns that arise
+```{r Pattern checking, echo=F }
+
+reg <- lm(Wins ~ ., data=sim_df)
+
+kable(tidy(summary(reg)))
+print(summary(reg)$r.squared)
+
+```
+
+
